@@ -23,7 +23,16 @@
 - [十三、训练或加载预训练模型（第 256–268 行）](#十三训练或加载预训练模型第-256268-行)
 - [十四、结果评估与可视化（第 270–277 行）](#十四结果评估与可视化第-270277-行)
 - [十五、推理耗时测量（第 283–291 行）](#十五推理耗时测量第-283291-行)
-- [附录：网络结构总览](#附录网络结构总览)
+- [附录 A：网络结构总览](#附录-a网络结构总览)
+- [附录 B：`Scripts/GetData.py` 数据加载模块](#附录-bscriptsgetdatapy-数据加载模块)
+  - [B.1 `loadData` 函数](#b1-loaddata-函数)
+  - [B.2 `dataset` 数据集类](#b2-dataset-数据集类)
+  - [B.3 `getDataLoaders` 函数](#b3-getdataloaders-函数)
+- [附录 C：`Scripts/Training.py` 训练模块](#附录-cscriptstrainingpy-训练模块)
+  - [C.1 `EarlyStopper` 早停类](#c1-earlystopper-早停类)
+  - [C.2 `train` 训练函数](#c2-train-训练函数)
+- [附录 D：`Scripts/PlotResults.py` 可视化模块](#附录-dscriptsplotresultspy-可视化模块)
+- [附录 E：`Scripts/SavedParameters.py` 超参数存储模块](#附录-escriptssavedparameterspy-超参数存储模块)
 
 ---
 
@@ -620,7 +629,7 @@ $$\bar{t} = \frac{t_{\text{total}}}{N_{\text{test}}}$$
 
 ---
 
-## 附录：网络结构总览
+## 附录 A：网络结构总览
 
 | 层名称 | 类型 | 输入维度 | 输出维度 | 激活函数 |
 |--------|------|----------|----------|---------|
@@ -633,3 +642,425 @@ $$\bar{t} = \frac{t_{\text{total}}}{N_{\text{test}}}$$
 $$\hat{\mathbf{u}}_b = \mathcal{N}_\theta(\boldsymbol{\chi}) \approx \mathbf{u}_b^*(\boldsymbol{\chi})$$
 
 其中 $\mathbf{u}_b^*(\boldsymbol{\chi})$ 为对应边界条件下离散欧拉弹性曲线方程的真实解。
+
+---
+
+## 附录 B：`Scripts/GetData.py` 数据加载模块
+
+本模块负责从磁盘读取原始数据集、构建 PyTorch `Dataset` 对象以及将数据划分为训练/验证/测试三个子集并封装为 `DataLoader`。
+
+---
+
+### B.1 `loadData` 函数
+
+```python
+ 1. import numpy as np
+ 2. import os
+ 3. import torch
+ 4. from torch.utils.data import Dataset, DataLoader
+ 5. import random
+ 7. def loadData(datacase = 1):
+ 9.     original_dir = os.getcwd()
+10.     root_dir = os.path.normpath(os.getcwd() + os.sep + os.pardir)
+11.     os.chdir(root_dir+"/DataSets")
+13.     both_ends_360_sol = open("both_ends.txt", "r")
+14.     trajectoriesload_b_360 = np.loadtxt(both_ends_360_sol)
+16.     right_end_360_sol = open("right_end.txt", "r")
+17.     trajectoriesload_r_360 = np.loadtxt(right_end_360_sol)
+19.     if datacase == 1:
+20.         trajectories_train = trajectoriesload_b_360
+21.         trajectories_test = trajectories_train
+22.     elif datacase == 2:
+23.         trajectories_train = np.concatenate((trajectoriesload_b_360, trajectoriesload_r_360), axis = 0)
+24.         trajectories_test = trajectories_train
+26.         print("Warning! Must be an integer between 1 and 3")
+28.     num_nodes = trajectories_train.shape[1]//4
+29.     os.chdir(original_dir)
+30.     return num_nodes, trajectories_train, trajectories_test
+```
+
+- **第 1–5 行**：导入依赖库：`numpy` 用于矩阵运算，`os` 用于路径切换，`torch` 及 `Dataset`/`DataLoader` 用于后续数据封装，`random` 用于随机打乱。
+- **第 9–11 行**：记录当前工作目录，向上一级找到项目根目录，然后切换到 `DataSets` 子目录以读取数据文件。
+- **第 13–17 行**：分别读取 `both_ends.txt`（两端均指定边界条件的解集）和 `right_end.txt`（仅右端指定边界条件的解集），以 `numpy` 二维数组形式加载。每行代表一条离散弹性曲线的完整状态向量，每条曲线有 $N$ 个节点，每个节点存储 4 个量 $(q_x, q_y, q_x', q_y')$，因此每行共 $4N$ 列。
+- **第 19–24 行**：根据 `datacase` 选择数据集：
+  - `datacase=1`：仅使用两端数据集；
+  - `datacase=2`：将两端数据集与右端数据集按行拼接：
+
+$$\mathbf{D}_{\text{train}} = \begin{bmatrix} \mathbf{D}_{\text{both}} \\ \mathbf{D}_{\text{right}} \end{bmatrix} \in \mathbb{R}^{(n_1 + n_2) \times 4N}$$
+
+  其余值触发警告打印（注：源码警告文本写作 "between 1 and 3"，实际有效值为 1 与 2）。
+
+- **第 28 行**：从数据矩阵的列数推导节点总数：
+
+$$N = \left\lfloor \frac{\text{列数}}{4} \right\rfloor$$
+
+- **第 29–30 行**：恢复原始工作目录，返回节点数 $N$、训练数据矩阵和测试数据矩阵（在此函数中两者相同，后续由 `getDataLoaders` 负责划分）。
+
+---
+
+### B.2 `dataset` 数据集类
+
+```python
+32. class dataset(Dataset):
+33.   def __init__(self, x, y):
+35.     self.bcs = torch.from_numpy(x.astype(np.float32))
+36.     self.internal_node_outputs = torch.from_numpy(y.astype(np.float32))
+37.     self.length = x.shape[0]
+39.   def __getitem__(self, idx):
+40.     return self.bcs[idx], self.internal_node_outputs[idx]
+41.   def __len__(self):
+42.     return self.length
+```
+
+- **第 32 行**：定义 `dataset` 类，继承自 PyTorch `Dataset`，实现标准的数据集接口以支持 `DataLoader` 的批采样。
+- **第 33–37 行**（`__init__` 方法）：
+  - 将输入边界条件数组 $\mathbf{X} \in \mathbb{R}^{n \times 8}$ 和标签数组 $\mathbf{Y} \in \mathbb{R}^{n \times 4(N-2)}$ 分别转换为 float32 类型的 PyTorch 张量，存储为实例属性；
+  - `self.length` 保存样本总数 $n$。
+- **第 39–40 行**（`__getitem__` 方法）：根据索引 $i$ 返回第 $i$ 个样本的输入-输出对 $(\mathbf{x}_i, \mathbf{y}_i)$，供 `DataLoader` 拼装批数据。
+- **第 41–42 行**（`__len__` 方法）：返回数据集总样本数 $n$，供 `DataLoader` 计算批次数量使用：
+
+$$n_{\text{batch}} = \left\lceil \frac{n}{B} \right\rceil$$
+
+其中 $B$ 为批大小。
+
+---
+
+### B.3 `getDataLoaders` 函数
+
+```python
+45. def getDataLoaders(batch_size, datacase, percentage_train):
+47.     torch.manual_seed(1)
+48.     np.random.seed(1)
+49.     random.seed(1)
+51.     _, data_train, data_test = loadData(datacase)
+52.     x_full_train = np.concatenate((data_train[:,:4], data_train[:,-4:]), axis=1)
+53.     y_full_train = data_train[:,4:-4]
+54.     N = len(x_full_train)
+55.     NTrain = int(percentage_train*N)
+57.     idx_shuffle_train = np.arange(N)
+58.     random.shuffle(idx_shuffle_train)
+60.     x_full_train = x_full_train[idx_shuffle_train]
+61.     y_full_train = y_full_train[idx_shuffle_train]
+63.     x_full_test = np.concatenate((data_test[:,:4], data_test[:,-4:]), axis=1)
+64.     y_full_test = data_test[:,4:-4]
+66.     x_full_test = x_full_test[idx_shuffle_train]
+67.     y_full_test = y_full_test[idx_shuffle_train]
+69.     fact = 0.1
+70.     if percentage_train==0.8:
+71.         fact = 0.1
+72.     elif percentage_train==0.7:
+73.         fact = 0.15
+74.     else:
+75.         fact = 0.2
+77.     x_train, y_train = x_full_train[:NTrain], y_full_train[:NTrain]
+79.     Number_Test_Points = int(fact*N)
+80.     x_test, y_test = x_full_test[NTrain:NTrain+Number_Test_Points], y_full_test[NTrain:NTrain+Number_Test_Points]
+81.     x_val, y_val   = x_full_test[NTrain+Number_Test_Points:NTrain+2*Number_Test_Points], y_full_test[NTrain+Number_Test_Points:NTrain+2*Number_Test_Points]
+87.     trainset = dataset(x_train, y_train)
+88.     testset  = dataset(x_test, y_test)
+89.     valset   = dataset(x_val, y_val)
+91.     trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+92.     testloader  = DataLoader(testset,  batch_size=len(x_test), shuffle=True)
+93.     valloader   = DataLoader(valset,   batch_size=len(x_val),  shuffle=True)
+95.     return x_train, y_train, x_test, y_test, x_val, y_val, trainloader, testloader, valloader
+```
+
+- **第 47–49 行**：固定随机种子，保证每次调用得到相同的随机打乱顺序。
+- **第 51–53 行**：调用 `loadData` 获取完整数据矩阵，然后从中分离输入特征 $\mathbf{X}$ 和标签 $\mathbf{Y}$：
+  - 输入特征：取每行的前 4 列（左端节点状态）和后 4 列（右端节点状态）拼接，形成 8 维边界条件向量：
+
+$$\mathbf{x}_i = \left[q_x^{(0)},\, q_y^{(0)},\, q_x^{\prime(0)},\, q_y^{\prime(0)},\, q_x^{(N-1)},\, q_y^{(N-1)},\, q_x^{\prime(N-1)},\, q_y^{\prime(N-1)}\right] \in \mathbb{R}^8$$
+
+  - 标签：取去掉首尾各 4 列后的中间 $4(N-2)$ 列，对应内部节点状态：
+
+$$\mathbf{y}_i = \left[q_x^{(1)},\, q_y^{(1)},\, q_x^{\prime(1)},\, q_y^{\prime(1)},\, \ldots,\, q_x^{(N-2)},\, q_y^{(N-2)},\, q_x^{\prime(N-2)},\, q_y^{\prime(N-2)}\right] \in \mathbb{R}^{4(N-2)}$$
+
+- **第 54–55 行**：计算总样本数 $n$ 和训练集大小：
+
+$$N_{\text{train}} = \lfloor p_{\text{train}} \times n \rfloor$$
+
+其中 $p_{\text{train}} \in \{0.1, 0.2, 0.4, 0.7, 0.8\}$ 为训练集比例（主函数通常使用 0.1、0.2、0.4、0.8 四个选项；代码内部亦处理 0.7 的情况）。
+
+- **第 57–61 行**：生成 $[0, n)$ 的整数索引，随机打乱后同步应用于输入和标签，保证 $\mathbf{x}_i$ 与 $\mathbf{y}_i$ 的对应关系不变。
+- **第 63–67 行**：对测试数据矩阵做与训练数据相同的特征/标签分离和同步打乱，保证训练集与测试集的样本顺序一致。
+- **第 69–75 行**：根据训练比例自适应设置测试/验证集比例系数 $f$：
+  - $p_{\text{train}} = 0.8$ 时，$f = 0.1$；
+  - $p_{\text{train}} = 0.7$ 时，$f = 0.15$；
+  - 其余情况，$f = 0.2$。
+- **第 77–81 行**：按索引切片划分三个子集：
+
+$$N_{\text{test}} = N_{\text{val}} = \lfloor f \times n \rfloor$$
+
+$$\mathbf{X}_{\text{train}} = \mathbf{X}_{[0: N_{\text{train}}]}, \quad \mathbf{X}_{\text{test}} = \mathbf{X}_{[N_{\text{train}}: N_{\text{train}}+N_{\text{test}}]}, \quad \mathbf{X}_{\text{val}} = \mathbf{X}_{[N_{\text{train}}+N_{\text{test}}: N_{\text{train}}+2N_{\text{test}}]}$$
+
+- **第 87–93 行**：将各子集封装为 `dataset` 对象，再包装为 `DataLoader`。训练集使用调用方传入的 `batch_size` 参数（主函数中为 32）并启用随机打乱（`shuffle=True`）；测试集和验证集使用全集大小的单批以方便整体评估。
+
+---
+
+## 附录 C：`Scripts/Training.py` 训练模块
+
+本模块定义了 `EarlyStopper` 早停工具类和核心 `train` 训练函数。
+
+---
+
+### C.1 `EarlyStopper` 早停类
+
+```python
+ 6. class EarlyStopper:
+ 7.     def __init__(self, patience=1, min_delta=0):
+ 8.         self.patience = patience
+ 9.         self.min_delta = min_delta
+10.         self.counter = 0
+11.         self.min_validation_loss = float('inf')
+13.     def early_stop(self, validation_loss):
+14.         if validation_loss < self.min_validation_loss:
+15.             self.min_validation_loss = validation_loss
+16.             self.counter = 0
+17.         elif validation_loss > (self.min_validation_loss + self.min_delta):
+18.             self.counter += 1
+19.             if self.counter >= self.patience:
+20.                 return True
+21.         return False
+```
+
+- **第 6 行**：定义早停工具类，用于在验证损失不再改善时提前终止训练，防止过拟合。
+- **第 7–11 行**（`__init__` 方法）：
+  - `patience`：允许验证损失连续不改善的最大轮数；
+  - `min_delta`：判断"改善"所要求的最小下降量；
+  - `counter`：记录当前连续未改善的轮数；
+  - `min_validation_loss`：历史最优验证损失，初始化为 $+\infty$。
+- **第 13–21 行**（`early_stop` 方法）：
+  - 若当前验证损失 $\mathcal{L}_{\text{val}}^{(t)} < \mathcal{L}_{\text{val}}^{*}$（历史最优），则更新最优记录并重置计数器；
+  - 若当前验证损失超过历史最优加容差阈值：
+
+$$\mathcal{L}_{\text{val}}^{(t)} > \mathcal{L}_{\text{val}}^{*} + \delta_{\min}$$
+
+则计数器加一；当计数器达到耐心值 $P$ 时，返回 `True` 触发早停：
+
+$$\text{stop} = \mathbf{1}\!\left[\text{counter} \geq P\right]$$
+
+> **注**：在本脚本中早停逻辑被注释掉（`train` 函数第 81–84 行），实际训练始终运行完整的 $E=300$ 个 epoch。
+
+---
+
+### C.2 `train` 训练函数
+
+```python
+23. def train(model, gamma, criterion, scheduler, optimizer, epochs, trainloader, valloader, device):
+25.     torch.manual_seed(1)
+26.     np.random.seed(1)
+27.     random.seed(1)
+29.     early_stopper = EarlyStopper(patience=100, min_delta=0)
+30.     losses = []
+31.     losses_val = []
+32.     for epoch in range(epochs):
+34.         train_loss = 0.
+35.         counter = 0.
+37.         for _, data in enumerate(trainloader):
+38.             inputs, labels = data[0].to(device), data[1].to(device)
+39.             optimizer.zero_grad()
+40.             predicted = model(inputs)
+42.             loss = criterion(predicted, labels)
+44.             predicted = torch.cat((inputs[:,:4], predicted, inputs[:,4:]), dim=1)
+45.             labels    = torch.cat((inputs[:,:4], labels,    inputs[:,4:]), dim=1)
+47.             predicted_first   = predicted[:,:-4]
+48.             predicted_forward = predicted[:,4:]
+50.             labels_first   = labels[:,:-4]
+51.             labels_forward = labels[:,4:]
+53.             diff_predicted = predicted_forward - predicted_first
+54.             diff_labels    = labels_forward    - labels_first
+56.             loss += gamma * criterion(diff_predicted, diff_labels)
+58.             train_loss += loss.item()
+60.             loss.backward()
+61.             optimizer.step()
+62.             counter += 1
+64.         avg_train_loss = train_loss / counter
+65.         losses.append(avg_train_loss)
+67.         model.eval()
+68.         with torch.no_grad():
+69.             data = next(iter(valloader))
+70.             inputs, labels = data[0].to(device), data[1].to(device)
+71.             predicted = model(inputs)
+74.             val_loss = criterion(predicted, labels)
+75.         model.train()
+76.         losses_val.append(val_loss.item())
+78.         if epoch % int(0.1*epochs) == 0 and epoch > 1:
+79.             print(f"The average loss in epoch {epoch+1} is ", avg_train_loss)
+87.         scheduler.step()
+88.     print('Training Done')
+98.     return loss
+```
+
+- **第 25–27 行**：固定随机种子，保证批次采样顺序可重复。
+- **第 29–31 行**：实例化早停器（实际未启用），初始化训练损失和验证损失历史列表。
+- **第 32 行**：外层循环，遍历 $E$ 个训练轮次（epoch）。
+- **第 34–35 行**：初始化本轮次的累积批损失和批次计数器。
+- **第 37–62 行**：内层批次循环，对每个 mini-batch $\mathcal{B}$ 执行完整的训练步骤：
+  1. **数据迁移**（第 38 行）：将批次输入 $\mathbf{X}_\mathcal{B} \in \mathbb{R}^{B \times 8}$ 和标签 $\mathbf{Y}_\mathcal{B} \in \mathbb{R}^{B \times 4(N-2)}$ 迁移到目标设备。
+  2. **梯度清零**（第 39 行）：$\nabla_\theta \leftarrow \mathbf{0}$，防止梯度累积。
+  3. **前向传播**（第 40 行）：$\hat{\mathbf{Y}}_\mathcal{B} = \mathcal{N}_\theta(\mathbf{X}_\mathcal{B})$。
+  4. **基础 MSE 损失**（第 42 行）：
+
+$$\mathcal{L}_{\text{MSE}} = \frac{1}{B} \sum_{i \in \mathcal{B}} \left\| \hat{\mathbf{y}}_i - \mathbf{y}_i \right\|^2$$
+
+  5. **完整轨迹拼接**（第 44–45 行）：将预测和真实标签的内部节点状态与边界条件拼接，还原为长度 $4N$ 的完整离散曲线状态向量：
+
+$$\tilde{\mathbf{y}}_i = \left[\mathbf{x}_i^{(L)},\; \hat{\mathbf{y}}_i,\; \mathbf{x}_i^{(R)}\right] \in \mathbb{R}^{4N}, \quad i \in \mathcal{B}$$
+
+其中 $\mathbf{x}_i^{(L)} = \mathbf{x}_i[:4]$（左端边界），$\mathbf{x}_i^{(R)} = \mathbf{x}_i[4:]$（右端边界）。
+
+  6. **差分正则化损失**（第 47–56 行）：计算相邻节点的离散差分并对比真实差分，以惩罚不光滑的预测：
+
+$$\mathbf{d}_i^{\text{pred}} = \tilde{\mathbf{y}}_i[4:] - \tilde{\mathbf{y}}_i[:-4], \quad \mathbf{d}_i^{\text{true}} = \tilde{\mathbf{y}}_i^*[4:] - \tilde{\mathbf{y}}_i^*[:-4]$$
+
+$$\mathcal{L}_{\text{diff}} = \frac{1}{B} \sum_{i \in \mathcal{B}} \left\| \mathbf{d}_i^{\text{pred}} - \mathbf{d}_i^{\text{true}} \right\|^2$$
+
+总损失为 MSE 损失与差分正则化损失之和：
+
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{MSE}} + \gamma \cdot \mathcal{L}_{\text{diff}}$$
+
+其中 $\gamma \in [0, 10^{-2}]$ 为超参数，控制差分正则化的强度。
+
+  7. **反向传播**（第 60 行）：$\nabla_\theta \mathcal{L}_{\text{total}} = \frac{\partial \mathcal{L}_{\text{total}}}{\partial \theta}$（自动微分）。
+  8. **参数更新**（第 61 行）：Adam 步骤（参数更新公式见主函数第 134 行）。
+
+- **第 64–65 行**：计算并记录本轮次的平均训练损失：
+
+$$\bar{\mathcal{L}}_{\text{train}}^{(e)} = \frac{1}{n_{\text{batch}}} \sum_{\mathcal{B}} \mathcal{L}_{\text{total}}(\mathcal{B})$$
+
+- **第 67–76 行**：切换推理模式，对验证集整批进行前向推理，计算验证 MSE 并记录；然后切回训练模式：
+
+$$\mathcal{L}_{\text{val}}^{(e)} = \frac{1}{n_{\text{val}}} \sum_{i=1}^{n_{\text{val}}} \left\| \mathcal{N}_\theta(\mathbf{x}_i^{\text{val}}) - \mathbf{y}_i^{\text{val}} \right\|^2$$
+
+- **第 78–79 行**：每隔 $\lfloor 0.1 \times E \rfloor$ 个 epoch 打印一次当前平均训练损失（在主函数 $E=300$ 时即每 30 个 epoch 打印一次）。
+- **第 87 行**：调用调度器更新学习率（每 135 个 epoch 将 $\eta$ 乘以 0.1）。
+- **第 98 行**：返回最后一个 mini-batch 的损失标量，供 `objective` 函数判断是否发生 NaN 异常。
+
+---
+
+## 附录 D：`Scripts/PlotResults.py` 可视化模块
+
+```python
+18. def plotResults(model, device, x_train, y_train, x_test, y_test, x_val, y_val,
+                   num_nodes, datacase, percentage_train, gamma, number_layers, hidden_nodes):
+20.     train_bcs = torch.from_numpy(x_train.astype(np.float32)).to(device)
+21.     test_bcs  = torch.from_numpy(x_test.astype(np.float32)).to(device)
+22.     val_bcs   = torch.from_numpy(x_val.astype(np.float32)).to(device)
+24.     pred_train = np.concatenate((x_train[:, :4], model(train_bcs).detach().cpu().numpy(), x_train[:, -4:]), axis=1)
+25.     pred_test  = np.concatenate((x_test[:, :4],  model(test_bcs).detach().cpu().numpy(),  x_test[:, -4:]),  axis=1)
+26.     pred_val   = np.concatenate((x_val[:, :4],   model(val_bcs).detach().cpu().numpy(),   x_val[:, -4:]),   axis=1)
+28.     true_train = np.concatenate((x_train[:, :4], y_train, x_train[:, -4:]), axis=1)
+29.     true_test  = np.concatenate((x_test[:, :4],  y_test,  x_test[:, -4:]),  axis=1)
+30.     true_val   = np.concatenate((x_val[:, :4],   y_val,   x_val[:, -4:]),   axis=1)
+32.     pred = np.concatenate((pred_train[:,4:-4], pred_test[:,4:-4], pred_val[:,4:-4]), axis=0)
+33.     true = np.concatenate((true_train[:,4:-4], true_test[:,4:-4], true_val[:,4:-4]), axis=0)
+34.     error_all        = np.mean((pred - true)**2)
+35.     error_training   = np.mean((pred_train[:,4:-4] - true_train[:,4:-4])**2)
+36.     error_testing    = np.mean((pred_test[:,4:-4]  - true_test[:,4:-4])**2)
+37.     error_validation = np.mean((pred_val[:,4:-4]   - true_val[:,4:-4])**2)
+39.     test_bvs = torch.from_numpy(x_test.astype(np.float32))
+40.     initial_time = time.time()
+41.     _ = model(test_bvs)
+42.     final_time = time.time()
+43.     total_time = final_time - initial_time
+62.     norms_q  = np.zeros((len(pred_test), num_nodes))
+63.     mean_q   = np.zeros(num_nodes)
+64.     norms_qp = np.zeros((len(pred_test), num_nodes))
+65.     mean_qp  = np.zeros(num_nodes)
+66.     for i in range(len(pred_test)):
+67.         for j in range(num_nodes):
+68.             norms_q[i, j]  = np.linalg.norm(pred_test[i, 4*j:4*j+2]   - true_test[i, 4*j:4*j+2])
+69.             mean_q[j]      = np.mean(norms_q[:, j])
+70.             norms_qp[i, j] = np.linalg.norm(pred_test[i, 4*j+2:4*j+4] - true_test[i, 4*j+2:4*j+4])
+71.             mean_qp[j]     = np.mean(norms_qp[:, j])
+```
+
+- **第 20–22 行**：将三个数据子集的输入特征转换为 float32 张量并迁移到目标设备，以备前向推理。
+- **第 24–26 行**：对训练集、测试集、验证集各自执行模型前向推理，将预测的内部节点状态与边界条件拼接，还原为完整的 $4N$ 维曲线状态向量：
+
+$$\hat{\mathbf{Y}}^{(\cdot)} = \left[\mathbf{X}^{(\cdot)}_{:,\;:4},\;\; \mathcal{N}_\theta(\mathbf{X}^{(\cdot)}),\;\; \mathbf{X}^{(\cdot)}_{:,\;-4:}\right] \in \mathbb{R}^{n_{(\cdot)} \times 4N}$$
+
+- **第 28–30 行**：类似地，将真实内部节点标签与边界条件拼接，构建完整真实曲线矩阵 $\mathbf{Y}^{(\cdot)}_{\text{true}}$。
+- **第 32–37 行**：合并三个子集的内部节点预测与真实值，计算各子集及总体的均方误差：
+
+$$\text{MSE}_{(\cdot)} = \frac{1}{n_{(\cdot)} \cdot 4(N-2)} \sum_{i,j} \left(\hat{Y}^{(\cdot)}_{ij} - Y^{(\cdot)}_{ij}\right)^2$$
+
+- **第 39–43 行**：在 CPU 上对测试集进行一次推理计时，测量批量预测总时间 $t_{\text{total}}$ 和平均单次时间 $\bar{t} = t_{\text{total}} / n_{\text{test}}$（与主函数第 283–291 行逻辑相同，此处用于写入结果文件）。
+- **第 62–71 行**：逐节点计算测试集上位置误差 $\|\mathbf{q}\|$ 和切向误差 $\|\mathbf{q}'\|$ 的平均范数：
+
+对第 $j$ 个节点，定义位置误差范数：
+$$e_q^{(i,j)} = \left\| \hat{\mathbf{q}}^{(i,j)} - \mathbf{q}^{(i,j)} \right\|_2, \quad \hat{\mathbf{q}}^{(i,j)} = \left(\hat{q}_x^{(j)}, \hat{q}_y^{(j)}\right)_i$$
+
+切向误差范数：
+$$e_{q'}^{(i,j)} = \left\| \hat{\mathbf{q}}^{\prime(i,j)} - \mathbf{q}^{\prime(i,j)} \right\|_2$$
+
+各节点上测试集平均误差：
+$$\bar{e}_q^{(j)} = \frac{1}{n_{\text{test}}} \sum_{i=1}^{n_{\text{test}}} e_q^{(i,j)}, \quad \bar{e}_{q'}^{(j)} = \frac{1}{n_{\text{test}}} \sum_{i=1}^{n_{\text{test}}} e_{q'}^{(i,j)}$$
+
+```python
+73.     if datacase == 1:
+74.         fig1 = plt.figure(figsize=((20, 15)))
+76.         plt.plot(true_test[i, np.arange(0, d, 4)], true_test[i, np.arange(1, d, 4)], '-', ...)
+77.         plt.plot(pred_test[i, np.arange(0, d, 4)], pred_test[i, np.arange(1, d, 4)], '--d', ...)
+81.         plt.xlabel(r"$q_x$", fontsize="45")
+82.         plt.ylabel(r"$q_y$", fontsize="45")
+88.         fig2 = plt.figure(figsize=((20, 15)))
+89.         circle = plt.Circle((0, 0), 1, color='k', alpha=0.5, fill=False)
+107.        fig3 = plt.figure(figsize=((20, 15)))
+108.        plt.plot(np.linspace(0, 50, 51), mean_q,  '-d', ...)
+109.        plt.plot(np.linspace(0, 50, 51), mean_qp, '-d', ...)
+```
+
+- **图 1（第 73–86 行）**：对比真实与预测的离散曲线在位置空间 $(q_x, q_y)$ 中的形态，绘制测试集中选取的若干样本曲线。索引步长 11（`datacase=1`）和 22（`datacase=2`）用于控制绘图密度。
+- **图 2（第 88–104 行）**：在单位圆参考系下，对比真实与预测的切向分量 $(q_x', q_y')$ 的分布，以散点图展示。单位圆（$\|\mathbf{q}'\|_2 = 1$）代表不可伸长弧长参数化约束：
+
+$$\left\| \mathbf{q}'(s) \right\|_2 = 1, \quad \forall s$$
+
+- **图 3（第 106–114 行）**：按节点编号 $k = 0, 1, \ldots, N-1$ 绘制沿曲线的平均位置误差 $\bar{e}_q^{(k)}$ 和切向误差 $\bar{e}_{q'}^{(k)}$，直观展示预测误差在曲线各节点上的分布规律。
+
+---
+
+## 附录 E：`Scripts/SavedParameters.py` 超参数存储模块
+
+```python
+ 1. import pandas as pd
+ 2. import numpy as np
+ 4. def hyperparams(case, pctg):
+ 6.     best_vals = pd.DataFrame()
+ 7.     best_vals["percentage_train"] = np.array([0.1, 0.2, 0.4, 0.8, 0.8])
+ 8.     best_vals["datacase"]         = np.array([1, 1, 1, 1, 2])
+ 9.     best_vals["gamma"]            = np.array([0.007044405451814177, 0.006335851468590373,
+                                                  0.009004175808977003, 0.003853035138801786,
+                                                  0.0073229668983443436])
+12.     best_vals["n_layers"]         = np.array([4, 4, 4, 4, 3])
+13.     best_vals["hidden_nodes"]     = np.array([950, 978, 997, 985, 616])
+15.     vals = best_vals[(best_vals['datacase'] == case) & (best_vals['percentage_train'] == pctg)]
+17.     nlayers      = vals.iloc[0]["n_layers"]
+18.     hidden_nodes = vals.iloc[0]["hidden_nodes"]
+19.     gamma        = vals.iloc[0]["gamma"]
+21.     params = {'n_layers':     int(nlayers),
+22.               'hidden_nodes': int(hidden_nodes),
+23.               'gamma':        gamma}
+24.     return params
+```
+
+- **第 1–2 行**：导入 `pandas` 用于表格查找，`numpy` 用于数组构建。
+- **第 4 行**：定义 `hyperparams` 函数，接收数据案例 `case` 和训练比例 `pctg`，返回对应的最优超参数字典。
+- **第 6–13 行**：以硬编码方式在 pandas DataFrame 中存储由 Optuna 搜索得到的最优超参数组合，共 5 组记录，覆盖如下配置：
+
+| `datacase` | `percentage_train` | $\gamma$ | `n_layers` ($L$) | `hidden_nodes` ($H$) |
+|:-----------:|:------------------:|:--------:|:----------------:|:-------------------:|
+| 1 | 0.1 | 0.00704 | 4 | 950 |
+| 1 | 0.2 | 0.00634 | 4 | 978 |
+| 1 | 0.4 | 0.00900 | 4 | 997 |
+| 1 | 0.8 | 0.00385 | 4 | 985 |
+| 2 | 0.8 | 0.00732 | 3 | 616 |
+
+- **第 15 行**：按 `datacase` 和 `percentage_train` 两个条件过滤 DataFrame，获取匹配的行：
+
+$$\text{row} = \{ \mathbf{v} \in \mathbf{D} \mid v_{\text{case}} = \texttt{case} \;\wedge\; v_{\text{pctg}} = \texttt{pctg} \}$$
+
+- **第 17–19 行**：从过滤结果的第一行提取 $L$（层数）、$H$（节点数）和 $\gamma$（差分正则化系数）三个超参数。
+- **第 21–24 行**：将提取到的超参数组装为字典并返回，其中 $L$ 和 $H$ 转换为 Python `int` 类型以兼容 PyTorch 的 `nn.Linear` 构造参数，$\gamma$ 保持 `float` 类型：
+
+$$\texttt{params} = \left\{ \texttt{n\_layers}: L,\; \texttt{hidden\_nodes}: H,\; \texttt{gamma}: \gamma \right\}$$
